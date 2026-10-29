@@ -10,10 +10,10 @@ import {
     addOrgMember,
     type CreateOrgWithOwnerResult,
 } from "../../fixtures/seed-data.js";
-import { organizations } from "../../../src/db/schema/index.js";
+import { organizations, users } from "../../../src/db/schema/index.js";
 import { ALL_LOOKUP_KEYS, resetPriceCatalogForTests } from "../../../src/cloud/billing/stripe-prices.js";
 import { resetBetaSlotsForTests } from "../../../src/cloud/billing/beta-slots.service.js";
-import { BETA_PRICE_SLOTS } from "../../../src/cloud/billing/plans.js";
+import { BETA_PRICE_SLOTS, TRIAL_DAYS } from "../../../src/cloud/billing/plans.js";
 
 /**
  * The full price catalog as Stripe would list it by lookup key: the price ID
@@ -93,7 +93,8 @@ describeCloud("POST /api/billing/checkout", () => {
         resetBetaSlotsForTests();
         mockPricesList.mockResolvedValue(CATALOG);
         mockSubscriptionsList.mockResolvedValue({ data: [] });
-        testData = await createOrgWithOwner(getTestDb());
+        // The org checking out has no plan yet (the fixtures default to a paying one).
+        testData = await createOrgWithOwner(getTestDb(), {}, { plan: "free" });
     });
 
     const ownerHeaders = () =>
@@ -170,6 +171,57 @@ describeCloud("POST /api/billing/checkout", () => {
         );
     });
 
+    it("starts every first checkout with the free trial, card collected up front", async () => {
+        mockCustomersCreate.mockResolvedValue({ id: "cus_new_123" });
+        mockCheckoutSessionsCreate.mockResolvedValue({ url: "https://checkout.stripe.com/pay/cs_test", id: "cs_1" });
+
+        const res = await request(app).post("/api/billing/checkout").set(ownerHeaders()).send({
+            plan: "pro",
+            successUrl: "http://localhost:3000/success",
+            cancelUrl: "http://localhost:3000/cancel",
+        });
+
+        expect(res.status).toBe(200);
+        expect(res.body).toEqual({ url: "https://checkout.stripe.com/pay/cs_test", trial: true });
+        expect(mockCheckoutSessionsCreate).toHaveBeenCalledWith(
+            expect.objectContaining({
+                payment_method_collection: "always",
+                subscription_data: {
+                    metadata: { orgId: testData.org.id, priceBook: "beta", userId: testData.user.id },
+                    trial_period_days: TRIAL_DAYS,
+                    trial_settings: { end_behavior: { missing_payment_method: "cancel" } },
+                },
+            }),
+        );
+    });
+
+    it("charges from day one when the acting user has already had a trial", async () => {
+        await getTestDb()
+            .update(users)
+            .set({ trialConsumedAt: new Date("2026-01-01T00:00:00Z") })
+            .where(eq(users.id, testData.user.id));
+        mockCustomersCreate.mockResolvedValue({ id: "cus_new_123" });
+        mockCheckoutSessionsCreate.mockResolvedValue({ url: "https://checkout.stripe.com/pay/cs_test", id: "cs_1" });
+
+        const res = await request(app).post("/api/billing/checkout").set(ownerHeaders()).send({
+            plan: "pro",
+            successUrl: "http://localhost:3000/success",
+            cancelUrl: "http://localhost:3000/cancel",
+        });
+
+        expect(res.status).toBe(200);
+        expect(res.body.trial).toBe(false);
+        const params = mockCheckoutSessionsCreate.mock.calls[0]![0] as {
+            payment_method_collection: string;
+            subscription_data: Record<string, unknown>;
+        };
+        // The card is still required: it is what the first invoice charges.
+        expect(params.payment_method_collection).toBe("always");
+        expect(params.subscription_data).toEqual({
+            metadata: { orgId: testData.org.id, priceBook: "beta", userId: testData.user.id },
+        });
+    });
+
     it("charges the beta monthly Pro price while Pro has a free slot", async () => {
         mockCustomersCreate.mockResolvedValue({ id: "cus_new_123" });
         mockCheckoutSessionsCreate.mockResolvedValue({ url: "https://checkout.stripe.com/pay/cs_test", id: "cs_1" });
@@ -185,7 +237,9 @@ describeCloud("POST /api/billing/checkout", () => {
         expect(mockCheckoutSessionsCreate).toHaveBeenCalledWith(
             expect.objectContaining({
                 line_items: [{ price: "price_stackradar_pro_monthly", quantity: 1 }],
-                subscription_data: { metadata: { orgId: testData.org.id, priceBook: "beta" } },
+                subscription_data: expect.objectContaining({
+                    metadata: { orgId: testData.org.id, priceBook: "beta", userId: testData.user.id },
+                }),
             }),
         );
     });
@@ -205,7 +259,9 @@ describeCloud("POST /api/billing/checkout", () => {
         expect(mockCheckoutSessionsCreate).toHaveBeenCalledWith(
             expect.objectContaining({
                 line_items: [{ price: "price_stackradar_pro_monthly_standard", quantity: 1 }],
-                subscription_data: { metadata: { orgId: testData.org.id, priceBook: "standard" } },
+                subscription_data: expect.objectContaining({
+                    metadata: { orgId: testData.org.id, priceBook: "standard", userId: testData.user.id },
+                }),
             }),
         );
     });
@@ -448,6 +504,28 @@ describeCloud("beta slot counter", () => {
                 team: { total: BETA_PRICE_SLOTS.team, claimed: BETA_PRICE_SLOTS.team },
             },
         });
+    });
+
+    it("GET /api/billing/pricing adds whether the caller's checkout would carry the trial", async () => {
+        stripeSlotsClaimed(0);
+        const headers = createInternalHeaders({
+            id: testData.user.id,
+            email: testData.user.email,
+            orgId: testData.org.id,
+        });
+
+        const fresh = await request(app).get("/api/billing/pricing").set(headers);
+        expect(fresh.status).toBe(200);
+        expect(fresh.headers["cache-control"]).toContain("private");
+        expect(fresh.body.trialEligible).toBe(true);
+
+        await getTestDb().update(users).set({ trialConsumedAt: new Date() }).where(eq(users.id, testData.user.id));
+        const repeat = await request(app).get("/api/billing/pricing").set(headers);
+        expect(repeat.body.trialEligible).toBe(false);
+
+        // The public counter says nothing about anybody.
+        const pub = await request(app).get("/v1/pricing");
+        expect(pub.body).not.toHaveProperty("trialEligible");
     });
 
     it("sums monthly and annual subscriptions into the plan's count", async () => {

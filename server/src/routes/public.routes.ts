@@ -3,6 +3,7 @@ import { sbomController } from "../controllers/sbom.controller.js";
 import { scannerController } from "../controllers/scanner.controller.js";
 import { requireAuth, requireScope } from "../middleware/auth.js";
 import { rateLimitByApiKey } from "../middleware/rate-limit.js";
+import { requireActivePlan } from "../lib/plan-gate.js";
 
 /*
  * Per-key ingest limits (S8). Sized for a real scanner: an initial scan of a
@@ -13,6 +14,10 @@ import { rateLimitByApiKey } from "../middleware/rate-limit.js";
  */
 const sbomUploadLimit = rateLimitByApiKey({ capacity: 60, refillPerMinute: 30, name: "SBOM upload" });
 const inventoryLimit = rateLimitByApiKey({ capacity: 5, refillPerMinute: 2, name: "inventory report" });
+// One check precedes each scan, and the scanner checks only once it holds a
+// scan slot, so the real rate is bounded by its scan concurrency; this is
+// far above that, and a 429 is "deferred" to the scanner, never "missing".
+const checkLimit = rateLimitByApiKey({ capacity: 120, refillPerMinute: 60, name: "SBOM check" });
 
 const router = Router();
 
@@ -27,15 +32,38 @@ const router = Router();
  * `cloud/index.ts` when the edition has it. A new `/v1` path also needs the
  * hosted ingress allow-list updated, or it answers 404 before reaching here.
  */
+/*
+ * An org without a plan (`lib/plan-gate.ts`) keeps its heartbeat — the agent
+ * stays up and is told `planRequired` — and loses the three writes: the
+ * inventory, the SBOM upload and the check that precedes it. The scanner
+ * treats a 403 on those as a report lost or a scan failed, never as a reason
+ * to exit, and the heartbeat is what its liveness probe reads. The gate sits
+ * behind each route's rate limit, so a refusal costs a token like any answer.
+ */
 router.post("/heartbeat", requireAuth, requireScope("sbom:write"), scannerController.heartbeat);
-router.post("/inventory", requireAuth, requireScope("sbom:write"), inventoryLimit, scannerController.reportInventory);
+router.post(
+    "/inventory",
+    requireAuth,
+    requireScope("sbom:write"),
+    inventoryLimit,
+    requireActivePlan,
+    scannerController.reportInventory,
+);
 router.post(
     "/sboms/upload/cyclonedx",
     requireAuth,
     requireScope("sbom:write"),
     sbomUploadLimit,
+    requireActivePlan,
     sbomController.uploadCycloneDx,
 );
-router.get("/sboms/check", requireAuth, requireScope("sbom:write"), sbomController.check);
+router.get(
+    "/sboms/check",
+    requireAuth,
+    requireScope("sbom:write"),
+    checkLimit,
+    requireActivePlan,
+    sbomController.check,
+);
 
 export default router;

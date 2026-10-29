@@ -3,6 +3,7 @@
 import { Fragment } from 'react';
 import { AlertCircle, CheckCircle, Table2 } from 'lucide-react';
 import { Spinner, VulnerabilityCounts } from '@/components/ui';
+import { PLAN_NAMES } from '@/components/organization-settings/constants';
 import { formatNumber, formatMax, type HealthTone } from './utils';
 import type { EcosystemEntry, SeverityCounts } from './types';
 
@@ -336,16 +337,29 @@ export function EcosystemChart({ entries }: { entries: EcosystemEntry[] }) {
 
 // ── PlanBadge ──────────────────────────────────────────────────────────────
 
-export function PlanBadge({ plan }: { plan: string }) {
+/**
+ * The stored plan value as it is sold: `team` is "Business", `free` is
+ * "No plan" (`PLAN_NAMES`); a value the client does not know is shown raw.
+ * A subscription in `trialing` status adds a "trial" chip: the plan is on,
+ * nothing has been charged yet.
+ */
+export function PlanBadge({ plan, status }: { plan: string; status?: string | null }) {
     const colors: Record<string, string> = {
         free: 'bg-surface-hover text-ink-secondary',
         pro: 'bg-accent-subtle text-accent',
     };
     return (
-        <span
-            className={`text-xs px-1.5 py-0.5 rounded-sm font-medium ${colors[plan] ?? 'bg-surface-hover text-ink-secondary'}`}
-        >
-            {plan}
+        <span className="inline-flex items-center gap-1">
+            <span
+                className={`text-xs px-1.5 py-0.5 rounded-sm font-medium ${colors[plan] ?? 'bg-surface-hover text-ink-secondary'}`}
+            >
+                {(PLAN_NAMES as Record<string, string>)[plan] ?? plan}
+            </span>
+            {status === 'trialing' && plan !== 'free' && (
+                <span className="text-xs px-1.5 py-0.5 rounded-sm font-medium bg-attention-subtle text-attention">
+                    trial
+                </span>
+            )}
         </span>
     );
 }
